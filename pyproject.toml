@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "ollama-copilot-enterprise"
+version = "0.1.0"
+description = ""
+authors = ["Daniel García Peña <info@iamdgarcia.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+streamlit = "^1.38.0"
+langchain-ollama = "^0.1.2"
+langchain = "^0.2.15"
+langchain-community = "^0.2.14"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
