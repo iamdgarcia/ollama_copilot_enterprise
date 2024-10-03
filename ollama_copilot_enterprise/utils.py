@@ -1,32 +1,61 @@
-from langchain.document_loaders import TextLoader
+# from langchain.document_loaders import TextLoader
+from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import CharacterTextSplitter
 import git
 import os
+import re
+import threading
+import pickle
+import faiss
 from queue import Queue
-local = False
-if local:
-    from dotenv import load_dotenv
-    load_dotenv()
-
-
-from langchain_core.vectorstores import InMemoryVectorStore
-
-from langchain_ollama import OllamaEmbeddings, ChatOllama
-model_name = "llama2:latest"
-model_kwargs = {"device": "cpu"}
-allowed_extensions = ['.py', '.ipynb', '.md']
-
+# from langchain.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+from langchain.docstore.in_memory import InMemoryDocstore
+from langchain.docstore.document import Document
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_community.vectorstores import FAISS
+from ollama_copilot_enterprise.chunker import HybridCodeChunker
+from langchain_community.vectorstores import FAISS
+
+allowed_extensions = ['.py', '.ipynb', '.md', '.json', '.yml']
+model_name = "llama3.1:latest"
+
+# Predefined templates for different file types
+REPO_FILE_TEMPLATES = {
+    '.py': 'This file contains Python code that defines {purpose}.',
+    '.md': 'This markdown file provides information regarding {purpose}.',
+    '.json': 'This JSON file is used for {purpose} configurations.',
+    '.yml': 'This YAML file defines {purpose} settings.'
+}
 
 class Embedder:
-    def __init__(self, git_link) -> None:
-        self.git_link = git_link
-        last_name = self.git_link.split('/')[-1]
-        self.clone_path = last_name.split('.')[0]
-        self.model = ChatOllama(model=model_name,temperature=0)  # switch to 'gpt-4'
-        self.model.invoke("HELO")
-        self.embeddings = OllamaEmbeddings(model=model_name,)
-        self.MyQueue =  Queue(maxsize=2)
+    """
+    Embedder class handles the cloning, loading, and chunking of GitHub repositories, 
+    followed by embedding the chunks and allowing for conversational retrieval.
+
+    Methods:
+    - clone_repo: Clones a GitHub repository into a local folder.
+    - extract_all_files: Extracts relevant files (e.g., .py, .md) from the repository.
+    - chunk_files: Uses HybridCodeChunker to split the extracted files into logical chunks.
+    - load_db: Loads or creates a vector store of embeddings.
+    - save_db: Saves the vector store and associated metadata.
+    - retrieve_results: Allows for conversational query retrieval using the embedded codebase.
+    """
+
+    def __init__(self, git_link=None, db_path="vectorstore_index.faiss", metadata_path="vectorstore_metadata.pkl") -> None:
+        self.model = ChatOllama(model=model_name, temperature=0)
+        self.embeddings = OllamaEmbeddings(model=model_name)
+        self.MyQueue = Queue(maxsize=2)
+        self.db_path = db_path
+        self.metadata_path = metadata_path
+        if git_link is not None:
+            self.git_link = git_link
+            last_name = self.git_link.split('/')[-1]
+            self.clone_path = last_name.split('.')[0]
+        else:
+            self.clone_path = None
+        self.chunker = HybridCodeChunker(chunk_size=1000, chunk_overlap=100)  # Use the hybrid chunker
 
     def add_to_queue(self, value):
         if self.MyQueue.full():
@@ -34,51 +63,94 @@ class Embedder:
         self.MyQueue.put(value)
 
     def clone_repo(self):
+        """Clones the GitHub repository if it does not already exist locally."""
         if not os.path.exists(self.clone_path):
-            # Clone the repository
             git.Repo.clone_from(self.git_link, self.clone_path)
 
     def extract_all_files(self):
+        """Extracts all code files with allowed extensions from the repository."""
+        print(f"Extracting files from {self.clone_path}")
         root_dir = self.clone_path
         self.docs = []
+        allowed_extensions = ['.py', '.ipynb', '.md', '.json', '.yml']
         for dirpath, dirnames, filenames in os.walk(root_dir):
             for file in filenames:
                 file_extension = os.path.splitext(file)[1]
                 if file_extension in allowed_extensions:
-                    try: 
+                    try:
                         loader = TextLoader(os.path.join(dirpath, file), encoding='utf-8')
-                        self.docs.extend(loader.load_and_split())
-                    except Exception as e: 
+                        documents = loader.load_and_split()
+                        for doc in documents:
+                            self.docs.append(doc.page_content)
+                    except Exception as e:
                         pass
-    
+        print("All files extracted")
+
     def chunk_files(self):
-        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-        self.texts = text_splitter.split_documents(self.docs)
-        self.num_texts = len(self.texts)
+        """Uses HybridCodeChunker to split the extracted files into manageable chunks."""
+        self.texts = []
+        for doc in self.docs:
+            self.texts.extend(self.chunker.split_code(doc))  # Use the hybrid chunker
 
     def load_db(self):
-        self.extract_all_files()
-        self.chunk_files()
-        texts = [t.page_content for t in self.texts]
-        vectorstore = InMemoryVectorStore.from_texts(texts,embedding=self.embeddings,)
-        self.retriever = vectorstore.as_retriever()
-    
-    def delete_directory(self, path):
-        if os.path.exists(path):
-            for root, dirs, files in os.walk(path, topdown=False):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    os.remove(file_path)
-                for dir in dirs:
-                    dir_path = os.path.join(root, dir)
-                    os.rmdir(dir_path)
-            os.rmdir(path)
-        
+        """Loads the vector store from disk or creates a new one from the extracted and chunked code."""
+        print("Loading DB")
+        if os.path.exists(self.db_path) and os.path.exists(self.metadata_path):
+            # Load vector store from disk
+            index = faiss.read_index(self.db_path)
+            with open(self.metadata_path, "rb") as f:
+                doc_texts = pickle.load(f)
+            
+            # Create a docstore and index_to_docstore_id map
+            docstore = InMemoryDocstore({str(i): Document(page_content=t) for i, t in enumerate(doc_texts)})
+            index_to_docstore_id = {i: str(i) for i in range(len(doc_texts))}
+            
+            # Initialize the FAISS vector store correctly
+            self.vectorstore = FAISS(
+                embedding_function=self.embeddings,  # Correctly pass the embedding function
+                index=index, 
+                docstore=docstore, 
+                index_to_docstore_id=index_to_docstore_id
+            )            
+            self.retriever = self.vectorstore.as_retriever()
+        else:
+            # If not found, create a new vector store
+            print("Creating a niew vectorstore")
+            self.extract_all_files()
+            self.chunk_files()
+            texts = [t for t in self.texts]
+            print("Creating vectorstore")
+            self.vectorstore = FAISS.from_texts(texts, embedding=self.embeddings)
+            self.retriever = self.vectorstore.as_retriever()
+            self.save_db()
 
+    def save_db(self):
+        """Saves the FAISS index and metadata (document texts) to disk."""
+        print("Saving DB")
+        faiss.write_index(self.vectorstore.index, self.db_path)
+        with open(self.metadata_path, "wb") as f:
+            pickle.dump(self.texts, f)
 
     def retrieve_results(self, query):
+        """Retrieves results for a conversational query using the embedded codebase."""
         chat_history = list(self.MyQueue.queue)
-        qa = ConversationalRetrievalChain.from_llm(self.model, chain_type="stuff", retriever=self.retriever, condense_question_llm = ChatOllama(model=model_name))
+        qa = ConversationalRetrievalChain.from_llm(
+            self.model,
+            chain_type="stuff",
+            retriever=self.retriever,
+            condense_question_llm=ChatOllama(model="llama3.1:latest")
+        )
         result = qa({"question": query, "chat_history": chat_history})
         self.add_to_queue((query, result["answer"]))
         return result['answer']
+
+
+
+
+if __name__ == "__main__":
+    em = Embedder()
+    em.clone_path = "/home/developer/proyectos/the-learning-curve/Manim/ollama_copilot_enterprise/manim"
+    # em.extract_all_files()
+    em.load_db()
+    print(em.retrieve_results("How can I create a circle using manim"))
+
