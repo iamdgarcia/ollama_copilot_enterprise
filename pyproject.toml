@@ -6,12 +6,16 @@ authors = ["Daniel García Peña <info@iamdgarcia.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.13"
 streamlit = "^1.38.0"
 langchain-ollama = "^0.1.2"
 langchain = "^0.2.15"
 langchain-community = "^0.2.14"
 faiss-cpu = "^1.8.0.post1"
+langgraph = "^0.2.34"
+fastapi = "^0.115.0"
+uvicorn = "^0.31.1"
+manim = "^0.18.1"
 
 
 [build-system]
